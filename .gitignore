@@ -1,0 +1,12 @@
+build/
+.vs/
+.idea/
+*.user
+*.vcxproj.user
+*.suo
+*.opensdf
+*.sdf
+*.log
+*.tmp
+*.db
+
