@@ -34,6 +34,16 @@ QString formatWindowLabel(const WindowInfo& info)
         .arg(info.processId);
 }
 
+QString formatDisplayLabel(const DisplayInfo& info)
+{
+    return QStringLiteral("%1  [%2x%3]  (%4, DPI x%5)")
+        .arg(info.name)
+        .arg(info.pixelSize.width())
+        .arg(info.pixelSize.height())
+        .arg(info.deviceName)
+        .arg(QString::number(info.dpiScale, 'f', 2));
+}
+
 QString describeState(RecordingState state)
 {
     switch (state) {
@@ -59,24 +69,30 @@ MainWindow::MainWindow(ApplicationContext& context, QWidget* parent)
 {
     buildUi();
     wireSignals();
-    refreshWindowList();
+    refreshCaptureTargetList();
     updateControls();
 }
 
 void MainWindow::buildUi()
 {
     setWindowTitle(QStringLiteral("MP4 Recorder"));
-    resize(860, 620);
+    resize(860, 640);
 
     auto* central = new QWidget(this);
     auto* rootLayout = new QVBoxLayout(central);
 
     auto* captureGroup = new QGroupBox(QStringLiteral("Capture Target"), central);
-    auto* captureLayout = new QHBoxLayout(captureGroup);
+    auto* captureLayout = new QFormLayout(captureGroup);
+    captureTypeSelector_ = new QComboBox(captureGroup);
+    captureTypeSelector_->addItem(QStringLiteral("Window"), static_cast<int>(CaptureTargetType::Window));
+    captureTypeSelector_->addItem(QStringLiteral("Display (Full Screen)"), static_cast<int>(CaptureTargetType::Display));
     windowSelector_ = new QComboBox(captureGroup);
+    displaySelector_ = new QComboBox(captureGroup);
     refreshButton_ = new QPushButton(QStringLiteral("Refresh"), captureGroup);
-    captureLayout->addWidget(windowSelector_, 1);
-    captureLayout->addWidget(refreshButton_);
+    captureLayout->addRow(QStringLiteral("Type"), captureTypeSelector_);
+    captureLayout->addRow(QStringLiteral("Window"), windowSelector_);
+    captureLayout->addRow(QStringLiteral("Display"), displaySelector_);
+    captureLayout->addRow(QStringLiteral("Targets"), refreshButton_);
 
     auto* outputGroup = new QGroupBox(QStringLiteral("Output"), central);
     auto* outputLayout = new QHBoxLayout(outputGroup);
@@ -138,14 +154,18 @@ void MainWindow::buildUi()
     rootLayout->addWidget(logGroup, 1);
 
     setCentralWidget(central);
-    appendLog(QStringLiteral("This build records real video and optional system audio to MP4. Microphone capture is not wired yet."));
+    appendLog(QStringLiteral("This build records a selected window or full display to MP4. Microphone capture is not wired yet."));
 }
 
 void MainWindow::wireSignals()
 {
     auto& controller = context_.recordingController();
 
-    connect(refreshButton_, &QPushButton::clicked, this, &MainWindow::refreshWindowList);
+    connect(refreshButton_, &QPushButton::clicked, this, &MainWindow::refreshCaptureTargetList);
+    connect(captureTypeSelector_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int) {
+        updateTargetSelectors();
+        updateControls();
+    });
     connect(outputPathEdit_, &QLineEdit::textChanged, this, [this]() {
         updateControls();
     });
@@ -191,6 +211,7 @@ void MainWindow::wireSignals()
     });
 
     connect(&controller, &RecordingController::windowsChanged, this, &MainWindow::updateWindowSelector);
+    connect(&controller, &RecordingController::displaysChanged, this, &MainWindow::updateDisplaySelector);
     connect(&controller, &RecordingController::stateChanged, this, [this](RecordingState state, const QString& detail) {
         statusLabel_->setText(describeState(state));
         appendLog(detail);
@@ -199,12 +220,12 @@ void MainWindow::wireSignals()
     connect(&controller, &RecordingController::logMessage, this, &MainWindow::appendLog);
 }
 
-void MainWindow::refreshWindowList()
+void MainWindow::refreshCaptureTargetList()
 {
-    const OperationResult result = context_.recordingController().refreshWindows();
+    const OperationResult result = context_.recordingController().refreshCaptureTargets();
     appendLog(result.message);
     if (!result.ok) {
-        QMessageBox::information(this, QStringLiteral("Window List"), result.message);
+        QMessageBox::information(this, QStringLiteral("Capture Targets"), result.message);
     }
 }
 
@@ -217,18 +238,46 @@ void MainWindow::updateWindowSelector(const QList<WindowInfo>& windows)
         windowSelector_->addItem(formatWindowLabel(window));
     }
 
+    updateTargetSelectors();
     updateControls();
+}
+
+void MainWindow::updateDisplaySelector(const QList<DisplayInfo>& displays)
+{
+    displays_ = displays;
+    displaySelector_->clear();
+
+    for (const auto& display : displays_) {
+        displaySelector_->addItem(formatDisplayLabel(display));
+    }
+
+    updateTargetSelectors();
+    updateControls();
+}
+
+void MainWindow::updateTargetSelectors()
+{
+    const auto targetType = static_cast<CaptureTargetType>(captureTypeSelector_->currentData().toInt());
+    const bool useWindow = targetType == CaptureTargetType::Window;
+    windowSelector_->setVisible(useWindow);
+    displaySelector_->setVisible(!useWindow);
 }
 
 void MainWindow::updateControls()
 {
     const bool recording = context_.recordingController().isRecording();
-    const bool hasWindows = !windows_.isEmpty();
+    const auto targetType = static_cast<CaptureTargetType>(captureTypeSelector_->currentData().toInt());
+    const bool hasWindowSelection = !windows_.isEmpty() && windowSelector_->currentIndex() >= 0;
+    const bool hasDisplaySelection = !displays_.isEmpty() && displaySelector_->currentIndex() >= 0;
+    const bool hasTarget = targetType == CaptureTargetType::Display ? hasDisplaySelection : hasWindowSelection;
     const bool hasOutputPath = !outputPathEdit_->text().trimmed().isEmpty();
-    startButton_->setEnabled(!recording && hasWindows && hasOutputPath);
+
+    startButton_->setEnabled(!recording && hasTarget && hasOutputPath);
     stopButton_->setEnabled(recording);
     refreshButton_->setEnabled(!recording);
-    windowSelector_->setEnabled(!recording);
+    captureTypeSelector_->setEnabled(!recording);
+    windowSelector_->setEnabled(!recording && targetType == CaptureTargetType::Window);
+    displaySelector_->setEnabled(!recording && targetType == CaptureTargetType::Display);
     browseButton_->setEnabled(!recording);
     outputPathEdit_->setEnabled(!recording);
 }
@@ -237,9 +286,19 @@ RecordingOptions MainWindow::collectOptions() const
 {
     RecordingOptions options;
 
-    const int index = windowSelector_->currentIndex();
-    if (index >= 0 && index < windows_.size()) {
-        options.window = windows_.at(index);
+    const auto targetType = static_cast<CaptureTargetType>(captureTypeSelector_->currentData().toInt());
+    options.target.type = targetType;
+
+    if (targetType == CaptureTargetType::Display) {
+        const int index = displaySelector_->currentIndex();
+        if (index >= 0 && index < displays_.size()) {
+            options.target.display = displays_.at(index);
+        }
+    } else {
+        const int index = windowSelector_->currentIndex();
+        if (index >= 0 && index < windows_.size()) {
+            options.target.window = windows_.at(index);
+        }
     }
 
     options.audio.captureSystemAudio = systemAudioCheck_->isChecked();

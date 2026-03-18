@@ -21,6 +21,17 @@ GraphicsCaptureItem createCaptureItemForWindow(quintptr nativeHandle)
     return item;
 }
 
+GraphicsCaptureItem createCaptureItemForMonitor(quintptr nativeHandle)
+{
+    auto interop = get_activation_factory<GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+    GraphicsCaptureItem item {nullptr};
+    check_hresult(interop->CreateForMonitor(
+        reinterpret_cast<HMONITOR>(nativeHandle),
+        guid_of<GraphicsCaptureItem>(),
+        reinterpret_cast<void**>(put_abi(item))));
+    return item;
+}
+
 IDirect3DDevice createDirect3DDevice(ID3D11Device* device)
 {
     com_ptr<IDXGIDevice> dxgiDevice;

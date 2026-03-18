@@ -21,6 +21,8 @@ qt_add_executable(mp4_recorder
     src/core/RecordingTypes.h
     src/platform/windows/WindowEnumerator.h
     src/platform/windows/WindowEnumerator.cpp
+    src/platform/windows/MonitorEnumerator.h
+    src/platform/windows/MonitorEnumerator.cpp
     src/platform/windows/WinRtHelpers.h
     src/platform/windows/WinRtHelpers.cpp
     src/platform/windows/WasapiLoopbackCapture.h

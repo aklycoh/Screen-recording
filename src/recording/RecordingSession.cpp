@@ -18,8 +18,12 @@ OperationResult RecordingSession::start(const RecordingOptions& options)
         return OperationResult::failure(QStringLiteral("A recording session is already active."));
     }
 
-    if (options.window.nativeHandle == 0) {
+    if (options.target.type == CaptureTargetType::Window && options.target.window.nativeHandle == 0) {
         return OperationResult::failure(QStringLiteral("No window selected."));
+    }
+
+    if (options.target.type == CaptureTargetType::Display && options.target.display.nativeHandle == 0) {
+        return OperationResult::failure(QStringLiteral("No display selected."));
     }
 
     if (options.output.outputFilePath.trimmed().isEmpty()) {

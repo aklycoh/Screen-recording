@@ -4,7 +4,7 @@
 
 This project is a Windows-only local screen recorder optimized for:
 
-- selecting one window
+- selecting one capture target (window first, full display supported)
 - recording stable video
 - exporting MP4
 - keeping phone playback compatibility higher than extreme fidelity
@@ -39,8 +39,8 @@ It is not a live streaming product and it does not prioritize complex editing.
 
 ## MVP scope
 
-- enumerate capturable windows
-- select one window
+- enumerate capturable windows and displays
+- select one window or one display
 - choose output path
 - optional system audio
 - optional microphone
@@ -75,7 +75,7 @@ It is not a live streaming product and it does not prioritize complex editing.
 ## Current implementation status
 
 - Qt desktop shell
-- window enumeration
+- window and display enumeration
 - asynchronous recording state machine
 - `Windows.Graphics.Capture` video capture backend
 - `WASAPI loopback` system audio backend

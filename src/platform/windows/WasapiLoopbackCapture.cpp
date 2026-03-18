@@ -430,9 +430,6 @@ void WasapiLoopbackCapture::captureThreadMain()
         notifyStartupResult(OperationResult::success(QStringLiteral("System audio loopback initialized.")));
 
         auto nextPollTime = std::chrono::steady_clock::now();
-        bool firstQpcPositionSeen = false;
-        UINT64 firstQpcPosition = 0;
-        std::uint64_t fallbackCapturedFrames = 0;
 
         while (!stopRequested_.load()) {
             nextPollTime += pollDuration;
@@ -457,25 +454,17 @@ void WasapiLoopbackCapture::captureThreadMain()
 
                 winrt::check_hresult(captureClient->ReleaseBuffer(frameCount));
                 if (packetCallback_) {
-                    std::int64_t timestamp100ns = static_cast<std::int64_t>(
-                        (static_cast<std::uint64_t>(fallbackCapturedFrames) * 10'000'000ULL) / format_.sampleRate);
-
-                    if (qpcPosition != 0 && qpcFrequency.QuadPart > 0) {
-                        if (!firstQpcPositionSeen) {
-                            firstQpcPosition = qpcPosition;
-                            firstQpcPositionSeen = true;
-                        }
-
-                        if (qpcPosition >= firstQpcPosition) {
-                            timestamp100ns = static_cast<std::int64_t>(
-                                std::llround(qpcTicksToHundredNs(qpcPosition - firstQpcPosition, qpcFrequency.QuadPart)));
-                        }
+                    if (qpcPosition == 0) {
+                        LARGE_INTEGER qpcNow {};
+                        QueryPerformanceCounter(&qpcNow);
+                        qpcPosition = static_cast<UINT64>(qpcTicksToHundredNs(qpcNow.QuadPart, qpcFrequency.QuadPart));
                     }
 
+                    // WASAPI already reports qpcPosition in 100-ns units here.
+                    const std::int64_t timestamp100ns = static_cast<std::int64_t>(qpcPosition);
                     packetCallback_(packet, frameCount, timestamp100ns);
                 }
 
-                fallbackCapturedFrames += frameCount;
                 winrt::check_hresult(captureClient->GetNextPacketSize(&nextPacketFrames));
             }
 

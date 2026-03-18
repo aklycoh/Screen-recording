@@ -14,6 +14,29 @@ struct WindowInfo
     bool minimized {false};
 };
 
+struct DisplayInfo
+{
+    quintptr nativeHandle {0};
+    QString name;
+    QString deviceName;
+    QSize pixelSize;
+    double dpiScale {1.0};
+    bool primary {false};
+};
+
+enum class CaptureTargetType
+{
+    Window,
+    Display
+};
+
+struct CaptureTarget
+{
+    CaptureTargetType type {CaptureTargetType::Window};
+    WindowInfo window;
+    DisplayInfo display;
+};
+
 struct AudioOptions
 {
     bool captureSystemAudio {true};
@@ -34,7 +57,7 @@ struct OutputOptions
 
 struct RecordingOptions
 {
-    WindowInfo window;
+    CaptureTarget target;
     AudioOptions audio;
     VideoOptions video;
     OutputOptions output;
@@ -48,4 +71,3 @@ enum class RecordingState
     Finalizing,
     Failed
 };
-

@@ -34,10 +34,11 @@ using namespace winrt::Windows::Storage::Streams;
 namespace
 {
 constexpr std::size_t kMaxQueuedFrames = 1;
-constexpr std::size_t kMaxQueuedAudioPackets = 256;
+constexpr std::size_t kMaxQueuedAudioPackets = 1024;
 constexpr uint32_t kDefaultAudioBitrate = 128000;
 constexpr std::int64_t kAudioGapTolerance100ns = 2 * 10'000;
 constexpr std::int64_t kDefaultSilenceChunk100ns = 10 * 10'000;
+constexpr std::int64_t kKeepAliveSilence100ns = 1 * 10'000;
 
 int evenFloor(int value)
 {
@@ -178,6 +179,15 @@ void WgcVideoRecorderBackend::run()
 
         prepareResult.TranscodeAsync().get();
 
+        QString fatalError;
+        {
+            std::lock_guard lock(mutex_);
+            fatalError = fatalErrorMessage_;
+        }
+        if (!fatalError.isEmpty()) {
+            throw std::runtime_error(fatalError.toStdString());
+        }
+
         finalizeOutputFile();
         finish(OperationResult::success(QStringLiteral("Recording finished and MP4 file finalized.")));
     } catch (const hresult_error& error) {
@@ -302,7 +312,16 @@ void WgcVideoRecorderBackend::initializeAudioCapture()
 
 void WgcVideoRecorderBackend::initializeCapture()
 {
-    captureItem_ = createCaptureItemForWindow(options_.window.nativeHandle);
+    if (options_.target.type == CaptureTargetType::Display) {
+        captureItem_ = createCaptureItemForMonitor(options_.target.display.nativeHandle);
+        log(QStringLiteral("Capture target: %1 (%2)")
+                .arg(options_.target.display.name)
+                .arg(options_.target.display.deviceName));
+    } else {
+        captureItem_ = createCaptureItemForWindow(options_.target.window.nativeHandle);
+        log(QStringLiteral("Capture target: %1").arg(options_.target.window.title));
+    }
+
     captureSize_ = initialCaptureSize();
     outputSize_ = outputSizeForCapture(captureSize_);
     frameDuration_ = fpsToFrameDuration(options_.video.targetFps);
@@ -356,12 +375,19 @@ void WgcVideoRecorderBackend::cleanup()
         firstFrame_.reset();
         lastDeliveredFrame_.reset();
         emittedFrameCount_ = 0;
+        firstVideoCaptureTimestamp100ns_ = 0;
+        lastVideoSampleTimestamp100ns_ = 0;
+        requiredAudioEnd100ns_ = 0;
         lastEmittedAudioEnd100ns_ = 0;
         sampleClockStart_ = {};
+        firstVideoCaptureTimestampSeen_ = false;
+        hasVideoSampleTimestamp_ = false;
         lastVideoSampleEnd_ = {};
         audioPacketObserved_ = false;
         audioSampleRequestedObserved_ = false;
+        sourceShutdownInitiated_ = false;
         videoStreamEnded_ = false;
+        fatalErrorMessage_.clear();
     }
     frameCv_.notify_all();
     audioCv_.notify_all();
@@ -433,10 +459,69 @@ void WgcVideoRecorderBackend::requestStopInternal(const QString& reason)
     {
         std::lock_guard lock(mutex_);
         stopRequested_.store(true);
+        requiredAudioEnd100ns_ = std::max(requiredAudioEnd100ns_, lastVideoSampleEnd_.count());
         stopReason_ = reason;
     }
     frameCv_.notify_all();
     audioCv_.notify_all();
+}
+
+void WgcVideoRecorderBackend::beginSourceShutdown()
+{
+    bool shouldShutdown = false;
+    {
+        std::lock_guard lock(mutex_);
+        if (!sourceShutdownInitiated_) {
+            sourceShutdownInitiated_ = true;
+            shouldShutdown = true;
+        }
+    }
+
+    if (!shouldShutdown) {
+        return;
+    }
+
+    if (framePool_) {
+        if (frameArrivedToken_.value != 0) {
+            framePool_.FrameArrived(frameArrivedToken_);
+            frameArrivedToken_ = {};
+        }
+        framePool_.Close();
+        framePool_ = nullptr;
+    }
+
+    if (captureItem_ && captureClosedToken_.value != 0) {
+        captureItem_.Closed(captureClosedToken_);
+        captureClosedToken_ = {};
+    }
+
+    if (captureSession_) {
+        captureSession_.Close();
+        captureSession_ = nullptr;
+    }
+
+    if (options_.audio.captureSystemAudio) {
+        loopbackCapture_.stop();
+    }
+
+    frameCv_.notify_all();
+    audioCv_.notify_all();
+}
+
+void WgcVideoRecorderBackend::setFatalError(const QString& message)
+{
+    bool shouldLog = false;
+    {
+        std::lock_guard lock(mutex_);
+        if (fatalErrorMessage_.isEmpty()) {
+            fatalErrorMessage_ = message;
+            shouldLog = true;
+        }
+    }
+
+    if (shouldLog) {
+        log(message);
+    }
 }
 
 void WgcVideoRecorderBackend::log(const QString& message) const
@@ -747,7 +832,7 @@ std::optional<WgcVideoRecorderBackend::QueuedFrame> WgcVideoRecorderBackend::wai
 {
     std::unique_lock lock(mutex_);
     frameCv_.wait_for(lock, timeout, [this] {
-        return stopRequested_.load() || firstFrame_.has_value() || !frameQueue_.empty();
+        return sourceShutdownInitiated_ || firstFrame_.has_value() || !frameQueue_.empty();
     });
 
     if (firstFrame_) {
@@ -774,7 +859,7 @@ void WgcVideoRecorderBackend::waitForAudioPacket(std::chrono::milliseconds timeo
 {
     std::unique_lock lock(mutex_);
     audioCv_.wait_for(lock, timeout, [this] {
-        return stopRequested_.load() || !audioQueue_.empty();
+        return sourceShutdownInitiated_ || !audioQueue_.empty();
     });
 }
 
@@ -794,7 +879,7 @@ void WgcVideoRecorderBackend::onAudioPacketCaptured(
     uint32_t frameCount,
     std::int64_t timestamp100ns)
 {
-    if (frameCount == 0 || stopRequested_.load()) {
+    if (frameCount == 0 || finished_.load()) {
         return;
     }
 
@@ -805,13 +890,16 @@ void WgcVideoRecorderBackend::onAudioPacketCaptured(
     packet.duration = TimeSpan {audioFramesToHundredNs(frameCount)};
 
     bool shouldLogFirstPacket = false;
+    bool overflowed = false;
     {
         std::lock_guard lock(mutex_);
         shouldLogFirstPacket = !audioPacketObserved_;
         audioPacketObserved_ = true;
-        audioQueue_.push_back(std::move(packet));
-        while (audioQueue_.size() > kMaxQueuedAudioPackets) {
-            audioQueue_.pop_front();
+        if (fatalErrorMessage_.isEmpty()) {
+            audioQueue_.push_back(std::move(packet));
+        }
+        if (audioQueue_.size() > kMaxQueuedAudioPackets) {
+            overflowed = true;
         }
     }
 
@@ -821,6 +909,11 @@ void WgcVideoRecorderBackend::onAudioPacketCaptured(
                 .arg(timestamp100ns / 10'000));
     }
 
+    if (overflowed) {
+        setFatalError(QStringLiteral("System audio queue overflowed because encoding could not keep up. Recording was stopped to avoid silent A/V drift."));
+        requestStopInternal(QStringLiteral("System audio queue overflowed."));
+    }
+
     audioCv_.notify_all();
 }
 
@@ -828,7 +921,7 @@ void WgcVideoRecorderBackend::onFrameArrived(
     const Direct3D11CaptureFramePool& sender,
     const winrt::Windows::Foundation::IInspectable&)
 {
-    if (stopRequested_.load()) {
+    if (finished_.load()) {
         return;
     }
 
@@ -839,12 +932,12 @@ void WgcVideoRecorderBackend::onFrameArrived(
 
     const QSize currentSize = toQSize(frame.ContentSize());
     if (currentSize != captureSize_) {
-        log(QStringLiteral("Window size changed from %1x%2 to %3x%4. Current build stops to protect MP4 integrity.")
+        log(QStringLiteral("Capture size changed from %1x%2 to %3x%4. Current build stops to protect MP4 integrity.")
                 .arg(captureSize_.width())
                 .arg(captureSize_.height())
                 .arg(currentSize.width())
                 .arg(currentSize.height()));
-        requestStopInternal(QStringLiteral("Window size changed during recording."));
+        requestStopInternal(QStringLiteral("Capture size changed during recording."));
         return;
     }
 
@@ -877,8 +970,8 @@ void WgcVideoRecorderBackend::onCaptureClosed(
     const GraphicsCaptureItem&,
     const winrt::Windows::Foundation::IInspectable&)
 {
-    log(QStringLiteral("The selected window was closed. Finalizing recording."));
-    requestStopInternal(QStringLiteral("The selected window was closed."));
+    log(QStringLiteral("The selected capture target became unavailable. Finalizing recording."));
+    requestStopInternal(QStringLiteral("The selected capture target became unavailable."));
 }
 
 void WgcVideoRecorderBackend::onStarting(
@@ -896,8 +989,13 @@ void WgcVideoRecorderBackend::onStarting(
         std::lock_guard lock(mutex_);
         firstFrame_ = std::move(firstFrame);
         emittedFrameCount_ = 0;
+        firstVideoCaptureTimestamp100ns_ = firstFrame_->timestamp.count();
+        lastVideoSampleTimestamp100ns_ = 0;
+        requiredAudioEnd100ns_ = 0;
         lastEmittedAudioEnd100ns_ = 0;
         sampleClockStart_ = std::chrono::steady_clock::now();
+        firstVideoCaptureTimestampSeen_ = true;
+        hasVideoSampleTimestamp_ = false;
         lastVideoSampleEnd_ = {};
         videoStreamEnded_ = false;
     }
@@ -923,12 +1021,16 @@ void WgcVideoRecorderBackend::onVideoSampleRequested(
     const IMediaStreamDescriptor&)
 {
     auto deferral = args.Request().GetDeferral();
+    if (stopRequested_.load()) {
+        beginSourceShutdown();
+    }
 
     std::chrono::steady_clock::time_point dueTime {};
     {
         std::lock_guard lock(mutex_);
         if (sampleClockStart_ != std::chrono::steady_clock::time_point {}) {
-            dueTime = sampleClockStart_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(frameDuration_ * emittedFrameCount_);
+            dueTime = sampleClockStart_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                           frameDuration_ * emittedFrameCount_);
         }
     }
 
@@ -936,9 +1038,10 @@ void WgcVideoRecorderBackend::onVideoSampleRequested(
         std::this_thread::sleep_until(dueTime);
     }
 
+    bool duplicatedLastFrame = false;
     auto frame = waitForFrame(frameWaitTimeout());
-    if (!frame && !stopRequested_.load()) {
-        const auto hwnd = reinterpret_cast<HWND>(options_.window.nativeHandle);
+    if (!frame && !stopRequested_.load() && options_.target.type == CaptureTargetType::Window) {
+        const auto hwnd = reinterpret_cast<HWND>(options_.target.window.nativeHandle);
         if (!IsWindow(hwnd)) {
             log(QStringLiteral("The selected window handle is no longer valid. Finalizing recording."));
             requestStopInternal(QStringLiteral("The selected window handle became invalid."));
@@ -952,6 +1055,7 @@ void WgcVideoRecorderBackend::onVideoSampleRequested(
         std::lock_guard lock(mutex_);
         if (lastDeliveredFrame_) {
             frame = lastDeliveredFrame_;
+            duplicatedLastFrame = true;
         }
     }
 
@@ -959,6 +1063,7 @@ void WgcVideoRecorderBackend::onVideoSampleRequested(
         {
             std::lock_guard lock(mutex_);
             videoStreamEnded_ = true;
+            requiredAudioEnd100ns_ = std::max(requiredAudioEnd100ns_, lastVideoSampleEnd_.count());
         }
         args.Request().Sample(nullptr);
         deferral.Complete();
@@ -969,8 +1074,27 @@ void WgcVideoRecorderBackend::onVideoSampleRequested(
     {
         std::lock_guard lock(mutex_);
         lastDeliveredFrame_ = frame;
-        sampleTimestamp = frameDuration_ * emittedFrameCount_;
+
+        if (!firstVideoCaptureTimestampSeen_) {
+            firstVideoCaptureTimestamp100ns_ = frame->timestamp.count();
+            firstVideoCaptureTimestampSeen_ = true;
+        }
+
+        std::int64_t timestamp100ns = frame->timestamp.count() - firstVideoCaptureTimestamp100ns_;
+        timestamp100ns = std::max<std::int64_t>(0, timestamp100ns);
+
+        if (hasVideoSampleTimestamp_) {
+            if (duplicatedLastFrame || timestamp100ns <= lastVideoSampleTimestamp100ns_) {
+                timestamp100ns = lastVideoSampleTimestamp100ns_ + frameDuration_.count();
+            }
+        } else {
+            hasVideoSampleTimestamp_ = true;
+        }
+
+        lastVideoSampleTimestamp100ns_ = timestamp100ns;
+        sampleTimestamp = TimeSpan {timestamp100ns};
         lastVideoSampleEnd_ = sampleTimestamp + frameDuration_;
+        requiredAudioEnd100ns_ = std::max(requiredAudioEnd100ns_, lastVideoSampleEnd_.count());
         videoStreamEnded_ = false;
         ++emittedFrameCount_;
     }
@@ -988,6 +1112,9 @@ void WgcVideoRecorderBackend::onAudioSampleRequested(
     const IMediaStreamDescriptor&)
 {
     auto deferral = args.Request().GetDeferral();
+    if (stopRequested_.load()) {
+        beginSourceShutdown();
+    }
 
     bool shouldLogFirstAudioRequest = false;
     {
@@ -1009,6 +1136,21 @@ void WgcVideoRecorderBackend::onAudioSampleRequested(
         while (!audioQueue_.empty()) {
             auto nextPacket = std::move(audioQueue_.front());
             audioQueue_.pop_front();
+
+            if (firstVideoCaptureTimestampSeen_) {
+                std::int64_t relativeTimestamp100ns = nextPacket.timestamp.count() - firstVideoCaptureTimestamp100ns_;
+                if (relativeTimestamp100ns + nextPacket.duration.count() <= 0) {
+                    continue;
+                }
+
+                if (relativeTimestamp100ns < 0) {
+                    const uint32_t trimFrames = hundredNsToAudioFramesCeil(-relativeTimestamp100ns);
+                    trimAudioPacketFront(nextPacket, trimFrames);
+                    nextPacket.timestamp = TimeSpan {0};
+                } else {
+                    nextPacket.timestamp = TimeSpan {relativeTimestamp100ns};
+                }
+            }
 
             const std::int64_t overlap100ns = lastEmittedAudioEnd100ns_ - nextPacket.timestamp.count();
             if (overlap100ns > kAudioGapTolerance100ns) {
@@ -1045,17 +1187,17 @@ void WgcVideoRecorderBackend::onAudioSampleRequested(
                 packet = createSilenceAudioPacket(lastEmittedAudioEnd100ns_, silenceFrames);
                 lastEmittedAudioEnd100ns_ = packet->timestamp.count() + packet->duration.count();
             } else {
-                const std::int64_t desiredAudioEnd100ns = lastVideoSampleEnd_.count();
-                if (lastEmittedAudioEnd100ns_ < desiredAudioEnd100ns) {
-                    const std::int64_t gap100ns = desiredAudioEnd100ns - lastEmittedAudioEnd100ns_;
+                const std::int64_t targetAudioEnd100ns = std::max(requiredAudioEnd100ns_, lastVideoSampleEnd_.count());
+                if (lastEmittedAudioEnd100ns_ < targetAudioEnd100ns) {
+                    const std::int64_t gap100ns = targetAudioEnd100ns - lastEmittedAudioEnd100ns_;
                     const uint32_t silenceFrames = std::max<uint32_t>(
                         1,
                         hundredNsToAudioFramesCeil(std::min(gap100ns, kDefaultSilenceChunk100ns)));
                     packet = createSilenceAudioPacket(lastEmittedAudioEnd100ns_, silenceFrames);
                     lastEmittedAudioEnd100ns_ = packet->timestamp.count() + packet->duration.count();
-                } else if (!videoStreamEnded_
-                    && lastEmittedAudioEnd100ns_ <= desiredAudioEnd100ns + kDefaultSilenceChunk100ns) {
-                    const uint32_t silenceFrames = std::max<uint32_t>(1, hundredNsToAudioFramesCeil(kDefaultSilenceChunk100ns));
+                } else if (!videoStreamEnded_) {
+                    // Keep audio stream alive until video stream explicitly reports end.
+                    const uint32_t silenceFrames = std::max<uint32_t>(1, hundredNsToAudioFramesCeil(kKeepAliveSilence100ns));
                     packet = createSilenceAudioPacket(lastEmittedAudioEnd100ns_, silenceFrames);
                     lastEmittedAudioEnd100ns_ = packet->timestamp.count() + packet->duration.count();
                 }

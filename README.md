@@ -1,6 +1,6 @@
 # MP4 Recorder
 
-Windows desktop recorder focused on one job: capture a single window and export an MP4 that is easy to share to a phone.
+Windows desktop recorder focused on one job: capture one selected target (window or full display) and export an MP4 that is easy to share to a phone.
 
 ## Current state
 
@@ -8,13 +8,13 @@ This repository currently contains:
 
 - an engineering architecture document in `docs/architecture.md`
 - a Qt 6 + CMake runnable shell
-- a Win32 window enumerator
+- a Win32 window and display enumerator
 - a real `Windows.Graphics.Capture -> MediaTranscoder -> MP4` video path
 - recording pipeline interfaces for capture, audio, encoding, and MP4 muxing
 
 Current implementation status:
 
-- video MP4 recording is wired
+- video MP4 recording is wired for both window and display targets
 - `WASAPI loopback` system-audio recording is wired
 - microphone capture is intentionally still disabled
 - window resize currently stops the session to protect output integrity

@@ -21,11 +21,30 @@ QString describeState(RecordingState state)
 
     return QStringLiteral("Unknown");
 }
+
+QString describeTarget(const CaptureTarget& target)
+{
+    if (target.type == CaptureTargetType::Display) {
+        if (!target.display.name.isEmpty()) {
+            return target.display.name;
+        }
+        return QStringLiteral("Display");
+    }
+
+    if (!target.window.title.isEmpty()) {
+        return target.window.title;
+    }
+    return QStringLiteral("Window");
+}
 }
 
-RecordingController::RecordingController(WindowEnumerator& windowEnumerator, QObject* parent)
+RecordingController::RecordingController(
+    WindowEnumerator& windowEnumerator,
+    MonitorEnumerator& monitorEnumerator,
+    QObject* parent)
     : QObject(parent)
     , windowEnumerator_(windowEnumerator)
+    , monitorEnumerator_(monitorEnumerator)
     , session_(this)
 {
     connect(&session_, &RecordingSession::stateChanged, this, [this](RecordingState state, const QString& detail) {
@@ -39,6 +58,11 @@ const QList<WindowInfo>& RecordingController::availableWindows() const
     return availableWindows_;
 }
 
+const QList<DisplayInfo>& RecordingController::availableDisplays() const
+{
+    return availableDisplays_;
+}
+
 bool RecordingController::isRecording() const
 {
     return session_.state() == RecordingState::Recording
@@ -46,22 +70,26 @@ bool RecordingController::isRecording() const
         || session_.state() == RecordingState::Finalizing;
 }
 
-OperationResult RecordingController::refreshWindows()
+OperationResult RecordingController::refreshCaptureTargets()
 {
     availableWindows_ = windowEnumerator_.enumerateWindows();
+    availableDisplays_ = monitorEnumerator_.enumerateMonitors();
     emit windowsChanged(availableWindows_);
+    emit displaysChanged(availableDisplays_);
 
-    if (availableWindows_.isEmpty()) {
-        return OperationResult::failure(QStringLiteral("No visible top-level windows were found."));
+    if (availableWindows_.isEmpty() && availableDisplays_.isEmpty()) {
+        return OperationResult::failure(QStringLiteral("No capture targets were found."));
     }
 
-    emit logMessage(QStringLiteral("Enumerated %1 candidate windows.").arg(availableWindows_.size()));
-    return OperationResult::success(QStringLiteral("Window list refreshed."));
+    emit logMessage(QStringLiteral("Enumerated %1 windows and %2 displays.")
+                        .arg(availableWindows_.size())
+                        .arg(availableDisplays_.size()));
+    return OperationResult::success(QStringLiteral("Capture targets refreshed."));
 }
 
 OperationResult RecordingController::startRecording(const RecordingOptions& options)
 {
-    emit logMessage(QStringLiteral("Starting session for \"%1\".").arg(options.window.title));
+    emit logMessage(QStringLiteral("Starting session for \"%1\".").arg(describeTarget(options.target)));
     emit logMessage(QStringLiteral("Output file: %1").arg(options.output.outputFilePath));
     emit logMessage(QStringLiteral("Audio: system=%1 microphone=%2")
                         .arg(options.audio.captureSystemAudio ? QStringLiteral("on") : QStringLiteral("off"))

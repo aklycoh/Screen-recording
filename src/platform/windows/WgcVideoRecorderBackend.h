@@ -76,6 +76,8 @@ private:
     void cleanup();
     void finish(const OperationResult& result);
     void requestStopInternal(const QString& reason);
+    void beginSourceShutdown();
+    void setFatalError(const QString& message);
     void log(const QString& message) const;
     void initializeScaleContext();
     void initializeOutputTexturePool();
@@ -143,12 +145,19 @@ private:
     std::optional<QueuedFrame> firstFrame_;
     std::optional<QueuedFrame> lastDeliveredFrame_;
     std::int64_t emittedFrameCount_ {0};
+    std::int64_t firstVideoCaptureTimestamp100ns_ {0};
+    std::int64_t lastVideoSampleTimestamp100ns_ {0};
+    std::int64_t requiredAudioEnd100ns_ {0};
     std::int64_t lastEmittedAudioEnd100ns_ {0};
     std::chrono::steady_clock::time_point sampleClockStart_ {};
+    bool firstVideoCaptureTimestampSeen_ {false};
+    bool hasVideoSampleTimestamp_ {false};
     bool audioPacketObserved_ {false};
     bool audioSampleRequestedObserved_ {false};
+    bool sourceShutdownInitiated_ {false};
     bool videoStreamEnded_ {false};
     QString stopReason_;
+    QString fatalErrorMessage_;
 
     QSize captureSize_;
     QSize outputSize_;

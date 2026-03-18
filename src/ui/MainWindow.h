@@ -23,16 +23,21 @@ public:
 private:
     void buildUi();
     void wireSignals();
-    void refreshWindowList();
+    void refreshCaptureTargetList();
     void updateWindowSelector(const QList<WindowInfo>& windows);
+    void updateDisplaySelector(const QList<DisplayInfo>& displays);
+    void updateTargetSelectors();
     void updateControls();
     RecordingOptions collectOptions() const;
     void appendLog(const QString& message);
 
     ApplicationContext& context_;
     QList<WindowInfo> windows_;
+    QList<DisplayInfo> displays_;
 
+    QComboBox* captureTypeSelector_ {nullptr};
     QComboBox* windowSelector_ {nullptr};
+    QComboBox* displaySelector_ {nullptr};
     QPushButton* refreshButton_ {nullptr};
     QLineEdit* outputPathEdit_ {nullptr};
     QPushButton* browseButton_ {nullptr};
@@ -46,4 +51,3 @@ private:
     QLabel* statusLabel_ {nullptr};
     QPlainTextEdit* logView_ {nullptr};
 };
-
