@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -32,6 +33,7 @@ struct ID2D1Factory1;
 struct ID2D1Bitmap1;
 struct ID2D1Device;
 struct ID2D1DeviceContext;
+struct AsyncCallbackState;
 
 class WgcVideoRecorderBackend : public IRecordingBackend
 {
@@ -88,6 +90,8 @@ private:
     std::chrono::milliseconds frameWaitTimeout() const;
     std::chrono::milliseconds audioWaitTimeout() const;
     void finalizeOutputFile();
+    void stopAcceptingAsyncCallbacks();
+    void waitForAsyncCallbacks();
 
     winrt::Windows::Media::MediaProperties::MediaEncodingProfile createEncodingProfile() const;
     winrt::Windows::Media::Core::MediaStreamSource createMediaStreamSource();
@@ -124,9 +128,12 @@ private:
         winrt::Windows::Media::Core::MediaStreamSourceSampleRequestedEventArgs const& args,
         winrt::Windows::Media::Core::IMediaStreamDescriptor const& descriptor);
 
+    mutable std::mutex callbackMutex_;
     LogCallback logCallback_;
     StartedCallback startedCallback_;
     FinishedCallback finishedCallback_;
+    std::shared_ptr<AsyncCallbackState> callbackState_;
+
 
     RecordingOptions options_;
     std::filesystem::path finalOutputPath_;

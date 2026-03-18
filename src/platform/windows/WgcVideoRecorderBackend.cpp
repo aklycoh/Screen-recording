@@ -31,14 +31,78 @@ using namespace winrt::Windows::Media::MediaProperties;
 using namespace winrt::Windows::Media::Transcoding;
 using namespace winrt::Windows::Storage::Streams;
 
+struct AsyncCallbackState
+{
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool shuttingDown {false};
+    std::uint32_t activeCount {0};
+};
+
 namespace
 {
 constexpr std::size_t kMaxQueuedFrames = 1;
 constexpr std::size_t kMaxQueuedAudioPackets = 1024;
+constexpr std::int64_t kHundredNsPerSecond = 10'000'000;
 constexpr uint32_t kDefaultAudioBitrate = 128000;
 constexpr std::int64_t kAudioGapTolerance100ns = 2 * 10'000;
 constexpr std::int64_t kDefaultSilenceChunk100ns = 10 * 10'000;
 constexpr std::int64_t kKeepAliveSilence100ns = 1 * 10'000;
+
+class AsyncCallbackScope
+{
+public:
+    AsyncCallbackScope(const AsyncCallbackScope&) = delete;
+    AsyncCallbackScope& operator=(const AsyncCallbackScope&) = delete;
+    AsyncCallbackScope(AsyncCallbackScope&&) noexcept = default;
+    AsyncCallbackScope& operator=(AsyncCallbackScope&&) noexcept = default;
+
+    ~AsyncCallbackScope()
+    {
+        if (!state_) {
+            return;
+        }
+
+        bool shouldNotify = false;
+        {
+            std::lock_guard lock(state_->mutex);
+            if (state_->activeCount > 0) {
+                --state_->activeCount;
+            }
+            shouldNotify = state_->shuttingDown && state_->activeCount == 0;
+        }
+
+        if (shouldNotify) {
+            state_->cv.notify_all();
+        }
+    }
+
+    static std::optional<AsyncCallbackScope> tryEnter(const std::weak_ptr<AsyncCallbackState>& weakState)
+    {
+        const auto state = weakState.lock();
+        if (!state) {
+            return std::nullopt;
+        }
+
+        {
+            std::lock_guard lock(state->mutex);
+            if (state->shuttingDown) {
+                return std::nullopt;
+            }
+            ++state->activeCount;
+        }
+
+        return AsyncCallbackScope(state);
+    }
+
+private:
+    explicit AsyncCallbackScope(std::shared_ptr<AsyncCallbackState> state)
+        : state_(std::move(state))
+    {
+    }
+
+    std::shared_ptr<AsyncCallbackState> state_;
+};
 
 int evenFloor(int value)
 {
@@ -50,7 +114,8 @@ int evenFloor(int value)
 
 TimeSpan fpsToFrameDuration(int fps)
 {
-    return std::chrono::duration_cast<TimeSpan>(std::chrono::microseconds(1'000'000 / fps));
+    const auto safeFps = std::max(1, fps);
+    return TimeSpan {(kHundredNsPerSecond + safeFps / 2) / safeFps};
 }
 
 QString hresultMessage(const hresult_error& error)
@@ -73,7 +138,10 @@ VideoEncodingQuality chooseEncodingQuality(const QSize& outputSize)
 }
 }
 
-WgcVideoRecorderBackend::WgcVideoRecorderBackend() = default;
+WgcVideoRecorderBackend::WgcVideoRecorderBackend()
+    : callbackState_(std::make_shared<AsyncCallbackState>())
+{
+}
 
 WgcVideoRecorderBackend::~WgcVideoRecorderBackend()
 {
@@ -85,16 +153,19 @@ WgcVideoRecorderBackend::~WgcVideoRecorderBackend()
 
 void WgcVideoRecorderBackend::setLogCallback(LogCallback callback)
 {
+    std::lock_guard lock(callbackMutex_);
     logCallback_ = std::move(callback);
 }
 
 void WgcVideoRecorderBackend::setStartedCallback(StartedCallback callback)
 {
+    std::lock_guard lock(callbackMutex_);
     startedCallback_ = std::move(callback);
 }
 
 void WgcVideoRecorderBackend::setFinishedCallback(FinishedCallback callback)
 {
+    std::lock_guard lock(callbackMutex_);
     finishedCallback_ = std::move(callback);
 }
 
@@ -116,6 +187,7 @@ OperationResult WgcVideoRecorderBackend::start(const RecordingOptions& options)
     stopRequested_.store(false);
     started_.store(false);
     finished_.store(false);
+    callbackState_ = std::make_shared<AsyncCallbackState>();
 
     worker_ = std::thread([this]() { run(); });
 
@@ -162,8 +234,13 @@ void WgcVideoRecorderBackend::run()
 
         captureSession_.StartCapture();
         started_.store(true);
-        if (startedCallback_) {
-            startedCallback_();
+        StartedCallback startedCallback;
+        {
+            std::lock_guard lock(callbackMutex_);
+            startedCallback = startedCallback_;
+        }
+        if (startedCallback) {
+            startedCallback();
         }
 
         log(QStringLiteral("Video capture started."));
@@ -350,9 +427,28 @@ void WgcVideoRecorderBackend::initializeCapture()
         2,
         captureItem_.Size());
 
-    frameArrivedToken_ = framePool_.FrameArrived({this, &WgcVideoRecorderBackend::onFrameArrived});
+    const auto weakCallbacks = std::weak_ptr<AsyncCallbackState>(callbackState_);
+    frameArrivedToken_ = framePool_.FrameArrived(
+        [weakCallbacks, this](
+            const Direct3D11CaptureFramePool& sender,
+            const winrt::Windows::Foundation::IInspectable& args) {
+            auto guard = AsyncCallbackScope::tryEnter(weakCallbacks);
+            if (!guard) {
+                return;
+            }
+            onFrameArrived(sender, args);
+        });
     captureSession_ = framePool_.CreateCaptureSession(captureItem_);
-    captureClosedToken_ = captureItem_.Closed({this, &WgcVideoRecorderBackend::onCaptureClosed});
+    captureClosedToken_ = captureItem_.Closed(
+        [weakCallbacks, this](
+            const GraphicsCaptureItem& sender,
+            const winrt::Windows::Foundation::IInspectable& args) {
+            auto guard = AsyncCallbackScope::tryEnter(weakCallbacks);
+            if (!guard) {
+                return;
+            }
+            onCaptureClosed(sender, args);
+        });
 }
 
 void WgcVideoRecorderBackend::initializeTranscode()
@@ -367,6 +463,30 @@ void WgcVideoRecorderBackend::initializeTranscode()
 void WgcVideoRecorderBackend::cleanup()
 {
     loopbackCapture_.stop();
+
+    if (framePool_ && frameArrivedToken_.value != 0) {
+        framePool_.FrameArrived(frameArrivedToken_);
+        frameArrivedToken_ = {};
+    }
+
+    if (captureItem_ && captureClosedToken_.value != 0) {
+        captureItem_.Closed(captureClosedToken_);
+        captureClosedToken_ = {};
+    }
+
+    if (mediaStreamSource_) {
+        if (startingToken_.value != 0) {
+            mediaStreamSource_.Starting(startingToken_);
+            startingToken_ = {};
+        }
+        if (sampleRequestedToken_.value != 0) {
+            mediaStreamSource_.SampleRequested(sampleRequestedToken_);
+            sampleRequestedToken_ = {};
+        }
+    }
+
+    stopAcceptingAsyncCallbacks();
+    waitForAsyncCallbacks();
 
     {
         std::lock_guard lock(mutex_);
@@ -393,15 +513,8 @@ void WgcVideoRecorderBackend::cleanup()
     audioCv_.notify_all();
 
     if (framePool_) {
-        if (frameArrivedToken_.value != 0) {
-            framePool_.FrameArrived(frameArrivedToken_);
-        }
         framePool_.Close();
         framePool_ = nullptr;
-    }
-
-    if (captureItem_ && captureClosedToken_.value != 0) {
-        captureItem_.Closed(captureClosedToken_);
     }
 
     if (captureSession_) {
@@ -410,12 +523,6 @@ void WgcVideoRecorderBackend::cleanup()
     }
 
     if (mediaStreamSource_) {
-        if (startingToken_.value != 0) {
-            mediaStreamSource_.Starting(startingToken_);
-        }
-        if (sampleRequestedToken_.value != 0) {
-            mediaStreamSource_.SampleRequested(sampleRequestedToken_);
-        }
         mediaStreamSource_ = nullptr;
     }
 
@@ -449,8 +556,14 @@ void WgcVideoRecorderBackend::finish(const OperationResult& result)
         return;
     }
 
-    if (finishedCallback_) {
-        finishedCallback_(result);
+    FinishedCallback finishedCallback;
+    {
+        std::lock_guard lock(callbackMutex_);
+        finishedCallback = finishedCallback_;
+    }
+
+    if (finishedCallback) {
+        finishedCallback(result);
     }
 }
 
@@ -526,9 +639,39 @@ void WgcVideoRecorderBackend::setFatalError(const QString& message)
 
 void WgcVideoRecorderBackend::log(const QString& message) const
 {
-    if (logCallback_) {
-        logCallback_(message);
+    LogCallback logCallback;
+    {
+        std::lock_guard lock(callbackMutex_);
+        logCallback = logCallback_;
     }
+
+    if (logCallback) {
+        logCallback(message);
+    }
+}
+
+void WgcVideoRecorderBackend::stopAcceptingAsyncCallbacks()
+{
+    const auto state = callbackState_;
+    if (!state) {
+        return;
+    }
+
+    std::lock_guard lock(state->mutex);
+    state->shuttingDown = true;
+}
+
+void WgcVideoRecorderBackend::waitForAsyncCallbacks()
+{
+    const auto state = callbackState_;
+    if (!state) {
+        return;
+    }
+
+    std::unique_lock lock(state->mutex);
+    state->cv.wait(lock, [&state] {
+        return state->activeCount == 0;
+    });
 }
 
 QSize WgcVideoRecorderBackend::initialCaptureSize() const
@@ -690,8 +833,23 @@ MediaStreamSource WgcVideoRecorderBackend::createMediaStreamSource()
     }
 
     source.BufferTime(0s);
-    startingToken_ = source.Starting({this, &WgcVideoRecorderBackend::onStarting});
-    sampleRequestedToken_ = source.SampleRequested({this, &WgcVideoRecorderBackend::onSampleRequested});
+    const auto weakCallbacks = std::weak_ptr<AsyncCallbackState>(callbackState_);
+    startingToken_ = source.Starting(
+        [weakCallbacks, this](const MediaStreamSource& sender, const MediaStreamSourceStartingEventArgs& args) {
+            auto guard = AsyncCallbackScope::tryEnter(weakCallbacks);
+            if (!guard) {
+                return;
+            }
+            onStarting(sender, args);
+        });
+    sampleRequestedToken_ = source.SampleRequested(
+        [weakCallbacks, this](const MediaStreamSource& sender, const MediaStreamSourceSampleRequestedEventArgs& args) {
+            auto guard = AsyncCallbackScope::tryEnter(weakCallbacks);
+            if (!guard) {
+                return;
+            }
+            onSampleRequested(sender, args);
+        });
     return source;
 }
 
@@ -896,10 +1054,10 @@ void WgcVideoRecorderBackend::onAudioPacketCaptured(
         shouldLogFirstPacket = !audioPacketObserved_;
         audioPacketObserved_ = true;
         if (fatalErrorMessage_.isEmpty()) {
-            audioQueue_.push_back(std::move(packet));
-        }
-        if (audioQueue_.size() > kMaxQueuedAudioPackets) {
-            overflowed = true;
+            overflowed = audioQueue_.size() >= kMaxQueuedAudioPackets;
+            if (!overflowed) {
+                audioQueue_.push_back(std::move(packet));
+            }
         }
     }
 

@@ -4,6 +4,7 @@
 #include "core/RecordingTypes.h"
 
 #include <QObject>
+#include <atomic>
 #include <memory>
 
 class IRecordingBackend;
@@ -30,7 +31,7 @@ private:
     void setState(RecordingState state, const QString& detail);
     void resetBackend();
 
-    RecordingState state_ {RecordingState::Idle};
+    std::atomic<RecordingState> state_ {RecordingState::Idle};
     RecordingOptions lastOptions_;
     std::unique_ptr<IRecordingBackend> backend_;
 };

@@ -15,6 +15,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSpinBox>
+#include <QStandardPaths>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -22,7 +23,15 @@ namespace
 {
 QString defaultOutputPath()
 {
-    return QDir::toNativeSeparators(QStringLiteral("D:/下载/recording.mp4"));
+    QString outputDirectory = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+    if (outputDirectory.isEmpty()) {
+        outputDirectory = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+    }
+    if (outputDirectory.isEmpty()) {
+        outputDirectory = QDir::homePath();
+    }
+
+    return QDir::toNativeSeparators(QDir(outputDirectory).filePath(QStringLiteral("recording.mp4")));
 }
 
 QString formatWindowLabel(const WindowInfo& info)
@@ -44,23 +53,6 @@ QString formatDisplayLabel(const DisplayInfo& info)
         .arg(QString::number(info.dpiScale, 'f', 2));
 }
 
-QString describeState(RecordingState state)
-{
-    switch (state) {
-    case RecordingState::Idle:
-        return QStringLiteral("Idle");
-    case RecordingState::Preparing:
-        return QStringLiteral("Preparing");
-    case RecordingState::Recording:
-        return QStringLiteral("Recording");
-    case RecordingState::Finalizing:
-        return QStringLiteral("Finalizing");
-    case RecordingState::Failed:
-        return QStringLiteral("Failed");
-    }
-
-    return QStringLiteral("Unknown");
-}
 }
 
 MainWindow::MainWindow(ApplicationContext& context, QWidget* parent)
@@ -213,7 +205,7 @@ void MainWindow::wireSignals()
     connect(&controller, &RecordingController::windowsChanged, this, &MainWindow::updateWindowSelector);
     connect(&controller, &RecordingController::displaysChanged, this, &MainWindow::updateDisplaySelector);
     connect(&controller, &RecordingController::stateChanged, this, [this](RecordingState state, const QString& detail) {
-        statusLabel_->setText(describeState(state));
+        statusLabel_->setText(describeRecordingState(state));
         appendLog(detail);
         updateControls();
     });

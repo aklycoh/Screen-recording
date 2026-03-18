@@ -460,7 +460,8 @@ void WasapiLoopbackCapture::captureThreadMain()
                         qpcPosition = static_cast<UINT64>(qpcTicksToHundredNs(qpcNow.QuadPart, qpcFrequency.QuadPart));
                     }
 
-                    // WASAPI already reports qpcPosition in 100-ns units here.
+                    // GetBuffer reports qpcPosition on the same 100-ns QPC timeline used by
+                    // Direct3D11CaptureFrame::SystemRelativeTime.
                     const std::int64_t timestamp100ns = static_cast<std::int64_t>(qpcPosition);
                     packetCallback_(packet, frameCount, timestamp100ns);
                 }

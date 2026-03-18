@@ -4,24 +4,6 @@
 
 namespace
 {
-QString describeState(RecordingState state)
-{
-    switch (state) {
-    case RecordingState::Idle:
-        return QStringLiteral("Idle");
-    case RecordingState::Preparing:
-        return QStringLiteral("Preparing");
-    case RecordingState::Recording:
-        return QStringLiteral("Recording");
-    case RecordingState::Finalizing:
-        return QStringLiteral("Finalizing");
-    case RecordingState::Failed:
-        return QStringLiteral("Failed");
-    }
-
-    return QStringLiteral("Unknown");
-}
-
 QString describeTarget(const CaptureTarget& target)
 {
     if (target.type == CaptureTargetType::Display) {
@@ -49,7 +31,7 @@ RecordingController::RecordingController(
 {
     connect(&session_, &RecordingSession::stateChanged, this, [this](RecordingState state, const QString& detail) {
         emit stateChanged(state, detail);
-        emit logMessage(QStringLiteral("[%1] %2").arg(describeState(state), detail));
+        emit logMessage(QStringLiteral("[%1] %2").arg(describeRecordingState(state), detail));
     });
 }
 
@@ -65,9 +47,10 @@ const QList<DisplayInfo>& RecordingController::availableDisplays() const
 
 bool RecordingController::isRecording() const
 {
-    return session_.state() == RecordingState::Recording
-        || session_.state() == RecordingState::Preparing
-        || session_.state() == RecordingState::Finalizing;
+    const RecordingState state = session_.state();
+    return state == RecordingState::Recording
+        || state == RecordingState::Preparing
+        || state == RecordingState::Finalizing;
 }
 
 OperationResult RecordingController::refreshCaptureTargets()

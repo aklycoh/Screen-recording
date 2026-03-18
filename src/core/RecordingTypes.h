@@ -71,3 +71,21 @@ enum class RecordingState
     Finalizing,
     Failed
 };
+
+inline QString describeRecordingState(RecordingState state)
+{
+    switch (state) {
+    case RecordingState::Idle:
+        return QStringLiteral("Idle");
+    case RecordingState::Preparing:
+        return QStringLiteral("Preparing");
+    case RecordingState::Recording:
+        return QStringLiteral("Recording");
+    case RecordingState::Finalizing:
+        return QStringLiteral("Finalizing");
+    case RecordingState::Failed:
+        return QStringLiteral("Failed");
+    }
+
+    return QStringLiteral("Unknown");
+}

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /d/game/mp4 -not -path */.git/* -type d)"
+    ]
+  }
+}

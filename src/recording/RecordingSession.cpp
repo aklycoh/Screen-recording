@@ -14,7 +14,8 @@ RecordingSession::~RecordingSession() = default;
 
 OperationResult RecordingSession::start(const RecordingOptions& options)
 {
-    if (state_ != RecordingState::Idle && state_ != RecordingState::Failed) {
+    const RecordingState state = state_.load();
+    if (state != RecordingState::Idle && state != RecordingState::Failed) {
         return OperationResult::failure(QStringLiteral("A recording session is already active."));
     }
 
@@ -38,7 +39,7 @@ OperationResult RecordingSession::start(const RecordingOptions& options)
 
     backend_->setLogCallback([this](const QString& message) {
         QMetaObject::invokeMethod(this, [this, message]() {
-            emit stateChanged(state_, message);
+            emit stateChanged(state_.load(), message);
         }, Qt::QueuedConnection);
     });
 
@@ -74,7 +75,8 @@ OperationResult RecordingSession::start(const RecordingOptions& options)
 
 OperationResult RecordingSession::stop()
 {
-    if (state_ != RecordingState::Recording && state_ != RecordingState::Preparing) {
+    const RecordingState state = state_.load();
+    if (state != RecordingState::Recording && state != RecordingState::Preparing) {
         return OperationResult::failure(QStringLiteral("No active recording session."));
     }
 
@@ -88,7 +90,7 @@ OperationResult RecordingSession::stop()
 
 RecordingState RecordingSession::state() const
 {
-    return state_;
+    return state_.load();
 }
 
 RecordingOptions RecordingSession::lastOptions() const
@@ -98,8 +100,8 @@ RecordingOptions RecordingSession::lastOptions() const
 
 void RecordingSession::setState(RecordingState state, const QString& detail)
 {
-    state_ = state;
-    emit stateChanged(state_, detail);
+    state_.store(state);
+    emit stateChanged(state, detail);
 }
 
 std::unique_ptr<IRecordingBackend> RecordingSession::createBackend()
