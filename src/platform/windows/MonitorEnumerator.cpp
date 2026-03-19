@@ -53,6 +53,11 @@ BOOL CALLBACK enumMonitorsProc(HMONITOR monitor, HDC, LPRECT, LPARAM lParam)
     info.nativeHandle = reinterpret_cast<quintptr>(monitor);
     info.deviceName = QString::fromWCharArray(monitorInfo.szDevice);
     info.pixelSize = QSize(width, height);
+    info.geometry = QRect(
+        monitorInfo.rcMonitor.left,
+        monitorInfo.rcMonitor.top,
+        width,
+        height);
     info.primary = primary;
     info.dpiScale = queryMonitorScale(monitor);
     context->displays.push_back(std::move(info));

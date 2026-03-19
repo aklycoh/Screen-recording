@@ -16,8 +16,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 using namespace std::chrono_literals;
 
@@ -46,7 +48,7 @@ constexpr std::size_t kMaxQueuedAudioPackets = 1024;
 constexpr std::int64_t kHundredNsPerSecond = 10'000'000;
 constexpr uint32_t kDefaultAudioBitrate = 128000;
 constexpr std::int64_t kAudioGapTolerance100ns = 2 * 10'000;
-constexpr std::int64_t kDefaultSilenceChunk100ns = 10 * 10'000;
+constexpr std::int64_t kDefaultSilenceChunk100ns = 100 * 10'000;
 constexpr std::int64_t kKeepAliveSilence100ns = 1 * 10'000;
 
 class AsyncCallbackScope
@@ -110,6 +112,17 @@ int evenFloor(int value)
         return 2;
     }
     return value & ~1;
+}
+
+QRect fullCaptureRect(const QSize& size)
+{
+    return QRect(QPoint(0, 0), size);
+}
+
+QRect clampCaptureRegion(const CaptureRegion& region, const QSize& captureSize)
+{
+    return QRect(region.x, region.y, region.width, region.height)
+        .intersected(fullCaptureRect(captureSize));
 }
 
 TimeSpan fpsToFrameDuration(int fps)
@@ -389,7 +402,7 @@ void WgcVideoRecorderBackend::initializeAudioCapture()
 
 void WgcVideoRecorderBackend::initializeCapture()
 {
-    if (options_.target.type == CaptureTargetType::Display) {
+    if (options_.target.type == CaptureTargetType::Display || options_.target.type == CaptureTargetType::Region) {
         captureItem_ = createCaptureItemForMonitor(options_.target.display.nativeHandle);
         log(QStringLiteral("Capture target: %1 (%2)")
                 .arg(options_.target.display.name)
@@ -400,12 +413,27 @@ void WgcVideoRecorderBackend::initializeCapture()
     }
 
     captureSize_ = initialCaptureSize();
-    outputSize_ = outputSizeForCapture(captureSize_);
+    captureContentRect_ = fullCaptureRect(captureSize_);
+    if (options_.target.type == CaptureTargetType::Region) {
+        captureContentRect_ = clampCaptureRegion(options_.target.region, captureSize_);
+        if (captureContentRect_.width() < 2 || captureContentRect_.height() < 2) {
+            throw hresult_error(E_INVALIDARG, L"The selected capture region falls outside the chosen display.");
+        }
+    }
+
+    outputSize_ = outputSizeForCapture(captureContentRect_.size());
     frameDuration_ = fpsToFrameDuration(options_.video.targetFps);
 
-    log(QStringLiteral("Capture size: %1x%2").arg(captureSize_.width()).arg(captureSize_.height()));
+    if (options_.target.type == CaptureTargetType::Region) {
+        log(QStringLiteral("Display size: %1x%2").arg(captureSize_.width()).arg(captureSize_.height()));
+        log(QStringLiteral("Selected region: %1").arg(describeCaptureRegion(options_.target.region)));
+    }
 
-    if (captureSize_ != outputSize_) {
+    log(QStringLiteral("Capture size: %1x%2")
+            .arg(captureContentRect_.width())
+            .arg(captureContentRect_.height()));
+
+    if (captureContentRect_.size() != outputSize_) {
         log(QStringLiteral("Output size adjusted to %1x%2 for even H.264 dimensions.")
                 .arg(outputSize_.width())
                 .arg(outputSize_.height()));
@@ -534,6 +562,7 @@ void WgcVideoRecorderBackend::cleanup()
     audioStreamDescriptor_ = nullptr;
     videoStreamDescriptor_ = nullptr;
     captureItem_ = nullptr;
+    captureContentRect_ = {};
     direct3DDevice_ = nullptr;
     d2dContext_ = nullptr;
     d2dDevice_ = nullptr;
@@ -742,8 +771,8 @@ void WgcVideoRecorderBackend::initializeOutputTexturePool()
 bool WgcVideoRecorderBackend::shouldScaleOutput() const
 {
     return options_.video.maxOutputWidth > 0
-        && captureSize_.width() > options_.video.maxOutputWidth
-        && outputSize_.width() < evenFloor(captureSize_.width());
+        && captureContentRect_.width() > options_.video.maxOutputWidth
+        && outputSize_.width() < evenFloor(captureContentRect_.width());
 }
 
 QSize WgcVideoRecorderBackend::outputSizeForCapture(const QSize& captureSize) const
@@ -769,7 +798,7 @@ std::chrono::milliseconds WgcVideoRecorderBackend::frameWaitTimeout() const
 
 std::chrono::milliseconds WgcVideoRecorderBackend::audioWaitTimeout() const
 {
-    return 100ms;
+    return 250ms;
 }
 
 void WgcVideoRecorderBackend::finalizeOutputFile()
@@ -883,11 +912,11 @@ winrt::com_ptr<ID3D11Texture2D> WgcVideoRecorderBackend::cloneFrameTexture(ID3D1
 
     if (!shouldScaleOutput()) {
         const D3D11_BOX sourceBox {
+            static_cast<UINT>(captureContentRect_.left()),
+            static_cast<UINT>(captureContentRect_.top()),
             0,
-            0,
-            0,
-            static_cast<UINT>(outputSize_.width()),
-            static_cast<UINT>(outputSize_.height()),
+            static_cast<UINT>(captureContentRect_.left() + outputSize_.width()),
+            static_cast<UINT>(captureContentRect_.top() + outputSize_.height()),
             1};
 
         d3dContext_->CopySubresourceRegion(targetTexture.get(), 0, 0, 0, 0, sourceTexture, 0, &sourceBox);
@@ -911,7 +940,11 @@ winrt::com_ptr<ID3D11Texture2D> WgcVideoRecorderBackend::cloneFrameTexture(ID3D1
         D2D1::RectF(0.0f, 0.0f, static_cast<float>(outputSize_.width()), static_cast<float>(outputSize_.height())),
         1.0f,
         D2D1_INTERPOLATION_MODE_LINEAR,
-        D2D1::RectF(0.0f, 0.0f, static_cast<float>(captureSize_.width()), static_cast<float>(captureSize_.height())));
+        D2D1::RectF(
+            static_cast<float>(captureContentRect_.left()),
+            static_cast<float>(captureContentRect_.top()),
+            static_cast<float>(captureContentRect_.left() + captureContentRect_.width()),
+            static_cast<float>(captureContentRect_.top() + captureContentRect_.height())));
     check_hresult(d2dContext_->EndDraw());
     d2dContext_->SetTarget(nullptr);
 
@@ -1285,9 +1318,18 @@ void WgcVideoRecorderBackend::onAudioSampleRequested(
         log(QStringLiteral("MediaTranscoder requested the first audio sample."));
     }
 
-    waitForAudioPacket(audioWaitTimeout());
+    bool waitingForFirstAudioPacket = false;
+    {
+        std::lock_guard lock(mutex_);
+        waitingForFirstAudioPacket = !audioPacketObserved_;
+    }
 
+    waitForAudioPacket(waitingForFirstAudioPacket ? 750ms : audioWaitTimeout());
+
+    const std::int64_t targetAudioChunk100ns = std::max<std::int64_t>(frameDuration_.count(), kDefaultSilenceChunk100ns);
     std::optional<QueuedAudioPacket> packet;
+    std::vector<QByteArray> concatenatedSegments;
+    std::size_t concatenatedBytes = 0;
     {
         std::lock_guard lock(mutex_);
 
@@ -1322,7 +1364,7 @@ void WgcVideoRecorderBackend::onAudioSampleRequested(
 
             if (nextPacket.timestamp.count() > lastEmittedAudioEnd100ns_ + kAudioGapTolerance100ns) {
                 const std::int64_t gap100ns = nextPacket.timestamp.count() - lastEmittedAudioEnd100ns_;
-                const std::int64_t silenceDuration100ns = std::min(gap100ns, kDefaultSilenceChunk100ns);
+                const std::int64_t silenceDuration100ns = std::min(gap100ns, targetAudioChunk100ns);
                 const uint32_t silenceFrames = std::max<uint32_t>(1, hundredNsToAudioFramesCeil(silenceDuration100ns));
                 packet = createSilenceAudioPacket(lastEmittedAudioEnd100ns_, silenceFrames);
                 lastEmittedAudioEnd100ns_ = packet->timestamp.count() + packet->duration.count();
@@ -1336,12 +1378,68 @@ void WgcVideoRecorderBackend::onAudioSampleRequested(
 
             lastEmittedAudioEnd100ns_ = nextPacket.timestamp.count() + nextPacket.duration.count();
             packet = std::move(nextPacket);
+            concatenatedBytes = static_cast<std::size_t>(packet->pcm.size());
+
+            // Concatenate subsequent contiguous packets to deliver more audio per request.
+            // This prevents audio from falling behind video when the transcoder serializes
+            // sample requests and video pacing consumes most of the pipeline time.
+            while (!audioQueue_.empty() && packet->duration.count() < targetAudioChunk100ns) {
+                auto& front = audioQueue_.front();
+                std::int64_t frontRelTs = front.timestamp.count();
+                if (firstVideoCaptureTimestampSeen_) {
+                    frontRelTs -= firstVideoCaptureTimestamp100ns_;
+                }
+
+                const std::int64_t frontOverlap = lastEmittedAudioEnd100ns_ - frontRelTs;
+                if (frontOverlap > kAudioGapTolerance100ns) {
+                    break;
+                }
+
+                const std::int64_t frontGap = frontRelTs - lastEmittedAudioEnd100ns_;
+                if (frontGap > kAudioGapTolerance100ns) {
+                    break;
+                }
+
+                auto extraPacket = std::move(audioQueue_.front());
+                audioQueue_.pop_front();
+
+                if (firstVideoCaptureTimestampSeen_) {
+                    std::int64_t relTs = extraPacket.timestamp.count() - firstVideoCaptureTimestamp100ns_;
+                    if (relTs + extraPacket.duration.count() <= 0) {
+                        continue;
+                    }
+                    if (relTs < 0) {
+                        const uint32_t trimFrames = hundredNsToAudioFramesCeil(-relTs);
+                        trimAudioPacketFront(extraPacket, trimFrames);
+                    }
+                }
+
+                if (extraPacket.frameCount == 0 || extraPacket.pcm.isEmpty()) {
+                    continue;
+                }
+
+                concatenatedBytes += static_cast<std::size_t>(extraPacket.pcm.size());
+                concatenatedSegments.push_back(std::move(extraPacket.pcm));
+                packet->frameCount += extraPacket.frameCount;
+                packet->duration += extraPacket.duration;
+                lastEmittedAudioEnd100ns_ = packet->timestamp.count() + packet->duration.count();
+            }
+
             break;
         }
 
         if (!packet) {
             if (!stopRequested_.load()) {
-                const uint32_t silenceFrames = std::max<uint32_t>(1, hundredNsToAudioFramesCeil(kDefaultSilenceChunk100ns));
+                const bool hasObservedAudio = audioPacketObserved_;
+                const std::int64_t liveGap100ns = std::max<std::int64_t>(
+                    0,
+                    lastVideoSampleEnd_.count() - lastEmittedAudioEnd100ns_);
+                const std::int64_t silenceDuration100ns = hasObservedAudio && liveGap100ns > 0
+                    ? std::min(liveGap100ns, targetAudioChunk100ns)
+                    : targetAudioChunk100ns;
+                const uint32_t silenceFrames = std::max<uint32_t>(
+                    1,
+                    hundredNsToAudioFramesCeil(silenceDuration100ns));
                 packet = createSilenceAudioPacket(lastEmittedAudioEnd100ns_, silenceFrames);
                 lastEmittedAudioEnd100ns_ = packet->timestamp.count() + packet->duration.count();
             } else {
@@ -1350,7 +1448,7 @@ void WgcVideoRecorderBackend::onAudioSampleRequested(
                     const std::int64_t gap100ns = targetAudioEnd100ns - lastEmittedAudioEnd100ns_;
                     const uint32_t silenceFrames = std::max<uint32_t>(
                         1,
-                        hundredNsToAudioFramesCeil(std::min(gap100ns, kDefaultSilenceChunk100ns)));
+                        hundredNsToAudioFramesCeil(std::min(gap100ns, targetAudioChunk100ns)));
                     packet = createSilenceAudioPacket(lastEmittedAudioEnd100ns_, silenceFrames);
                     lastEmittedAudioEnd100ns_ = packet->timestamp.count() + packet->duration.count();
                 } else if (!videoStreamEnded_) {
@@ -1361,6 +1459,16 @@ void WgcVideoRecorderBackend::onAudioSampleRequested(
                 }
             }
         }
+    }
+
+    if (packet && !concatenatedSegments.empty()) {
+        QByteArray merged;
+        merged.reserve(static_cast<int>(std::min<std::size_t>(concatenatedBytes, static_cast<std::size_t>(std::numeric_limits<int>::max()))));
+        merged.append(packet->pcm);
+        for (auto& segment : concatenatedSegments) {
+            merged.append(segment);
+        }
+        packet->pcm = std::move(merged);
     }
 
     if (!packet) {

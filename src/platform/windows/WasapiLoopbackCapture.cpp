@@ -6,6 +6,8 @@
 #include <mmdeviceapi.h>
 #include <winrt/base.h>
 
+#include <QStringList>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -41,6 +43,7 @@ struct InputAudioFormat
 constexpr float kMinus3dBGain = 0.70710678f;
 constexpr float kMinus6dBGain = 0.5f;
 constexpr float kUnknownChannelGain = 0.25f;
+constexpr std::int64_t kTimestampBackwardsTolerance100ns = 5 * 10'000;
 
 QString hresultMessage(const winrt::hresult_error& error)
 {
@@ -146,6 +149,16 @@ double qpcTicksToHundredNs(UINT64 ticks, LONGLONG frequency)
         return 0.0;
     }
     return static_cast<double>(ticks) * 10'000'000.0 / static_cast<double>(frequency);
+}
+
+std::int64_t audioFramesToHundredNs(uint32_t frameCount, uint32_t sampleRate)
+{
+    if (sampleRate == 0 || frameCount == 0) {
+        return 0;
+    }
+
+    const auto numerator = static_cast<std::uint64_t>(frameCount) * 10'000'000ULL + sampleRate / 2;
+    return static_cast<std::int64_t>(numerator / sampleRate);
 }
 
 float clampUnit(float sample)
@@ -430,6 +443,9 @@ void WasapiLoopbackCapture::captureThreadMain()
         notifyStartupResult(OperationResult::success(QStringLiteral("System audio loopback initialized.")));
 
         auto nextPollTime = std::chrono::steady_clock::now();
+        std::int64_t nextExpectedTimestamp100ns = 0;
+        bool hasExpectedTimestamp = false;
+        bool loggedTimestampRecovery = false;
 
         while (!stopRequested_.load()) {
             nextPollTime += pollDuration;
@@ -454,15 +470,55 @@ void WasapiLoopbackCapture::captureThreadMain()
 
                 winrt::check_hresult(captureClient->ReleaseBuffer(frameCount));
                 if (packetCallback_) {
-                    if (qpcPosition == 0) {
+                    const bool timestampError = (flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR) != 0;
+                    const bool dataDiscontinuity = (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0;
+
+                    std::int64_t timestamp100ns = 0;
+                    bool usedFallbackTimestamp = false;
+                    if (!timestampError && qpcPosition != 0) {
+                        // GetBuffer reports qpcPosition on the same 100-ns QPC timeline used by
+                        // Direct3D11CaptureFrame::SystemRelativeTime.
+                        timestamp100ns = static_cast<std::int64_t>(qpcPosition);
+                    } else if (hasExpectedTimestamp) {
+                        timestamp100ns = nextExpectedTimestamp100ns;
+                        usedFallbackTimestamp = true;
+                    } else {
                         LARGE_INTEGER qpcNow {};
                         QueryPerformanceCounter(&qpcNow);
-                        qpcPosition = static_cast<UINT64>(qpcTicksToHundredNs(qpcNow.QuadPart, qpcFrequency.QuadPart));
+                        timestamp100ns = static_cast<std::int64_t>(std::llround(qpcTicksToHundredNs(
+                            static_cast<UINT64>(qpcNow.QuadPart),
+                            qpcFrequency.QuadPart)));
+                        usedFallbackTimestamp = true;
                     }
 
-                    // GetBuffer reports qpcPosition on the same 100-ns QPC timeline used by
-                    // Direct3D11CaptureFrame::SystemRelativeTime.
-                    const std::int64_t timestamp100ns = static_cast<std::int64_t>(qpcPosition);
+                    if (hasExpectedTimestamp) {
+                        const bool backwardsJump = timestamp100ns + kTimestampBackwardsTolerance100ns < nextExpectedTimestamp100ns;
+                        if (dataDiscontinuity || backwardsJump) {
+                            timestamp100ns = nextExpectedTimestamp100ns;
+                            usedFallbackTimestamp = true;
+                        }
+                    }
+
+                    const std::int64_t duration100ns = audioFramesToHundredNs(frameCount, format_.sampleRate);
+                    nextExpectedTimestamp100ns = timestamp100ns + duration100ns;
+                    hasExpectedTimestamp = true;
+
+                    if (!loggedTimestampRecovery && (timestampError || dataDiscontinuity || usedFallbackTimestamp)) {
+                        QStringList reasons;
+                        if (timestampError) {
+                            reasons.push_back(QStringLiteral("timestamp error"));
+                        }
+                        if (dataDiscontinuity) {
+                            reasons.push_back(QStringLiteral("data discontinuity"));
+                        }
+                        if (usedFallbackTimestamp) {
+                            reasons.push_back(QStringLiteral("clock fallback"));
+                        }
+                        log(QStringLiteral("WASAPI timestamp recovered via %1.")
+                                .arg(reasons.join(QStringLiteral(", "))));
+                        loggedTimestampRecovery = true;
+                    }
+
                     packetCallback_(packet, frameCount, timestamp100ns);
                 }
 

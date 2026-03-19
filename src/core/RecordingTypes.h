@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QRect>
 #include <QSize>
 #include <QString>
 #include <QtGlobal>
@@ -20,6 +21,7 @@ struct DisplayInfo
     QString name;
     QString deviceName;
     QSize pixelSize;
+    QRect geometry;
     double dpiScale {1.0};
     bool primary {false};
 };
@@ -27,7 +29,16 @@ struct DisplayInfo
 enum class CaptureTargetType
 {
     Window,
-    Display
+    Display,
+    Region
+};
+
+struct CaptureRegion
+{
+    int x {0};
+    int y {0};
+    int width {0};
+    int height {0};
 };
 
 struct CaptureTarget
@@ -35,6 +46,7 @@ struct CaptureTarget
     CaptureTargetType type {CaptureTargetType::Window};
     WindowInfo window;
     DisplayInfo display;
+    CaptureRegion region;
 };
 
 struct AudioOptions
@@ -88,4 +100,22 @@ inline QString describeRecordingState(RecordingState state)
     }
 
     return QStringLiteral("Unknown");
+}
+
+inline bool isValidCaptureRegion(const CaptureRegion& region)
+{
+    return region.width > 0 && region.height > 0;
+}
+
+inline QString describeCaptureRegion(const CaptureRegion& region)
+{
+    if (!isValidCaptureRegion(region)) {
+        return QStringLiteral("No region selected");
+    }
+
+    return QStringLiteral("%1,%2  %3x%4")
+        .arg(region.x)
+        .arg(region.y)
+        .arg(region.width)
+        .arg(region.height);
 }

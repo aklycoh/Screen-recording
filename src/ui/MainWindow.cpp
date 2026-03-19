@@ -1,6 +1,7 @@
 #include "ui/MainWindow.h"
 
 #include "common/OperationResult.h"
+#include "ui/RegionSelectionOverlay.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -53,6 +54,16 @@ QString formatDisplayLabel(const DisplayInfo& info)
         .arg(QString::number(info.dpiScale, 'f', 2));
 }
 
+QString regionSummaryText(const CaptureRegion& region)
+{
+    if (!isValidCaptureRegion(region)) {
+        return QStringLiteral("No region selected.");
+    }
+
+    return QStringLiteral("Selected area: %1")
+        .arg(describeCaptureRegion(region));
+}
+
 }
 
 MainWindow::MainWindow(ApplicationContext& context, QWidget* parent)
@@ -78,12 +89,22 @@ void MainWindow::buildUi()
     captureTypeSelector_ = new QComboBox(captureGroup);
     captureTypeSelector_->addItem(QStringLiteral("Window"), static_cast<int>(CaptureTargetType::Window));
     captureTypeSelector_->addItem(QStringLiteral("Display (Full Screen)"), static_cast<int>(CaptureTargetType::Display));
+    captureTypeSelector_->addItem(QStringLiteral("Display Region"), static_cast<int>(CaptureTargetType::Region));
     windowSelector_ = new QComboBox(captureGroup);
     displaySelector_ = new QComboBox(captureGroup);
+    regionControlsWidget_ = new QWidget(captureGroup);
+    auto* regionLayout = new QHBoxLayout(regionControlsWidget_);
+    regionLayout->setContentsMargins(0, 0, 0, 0);
+    selectRegionButton_ = new QPushButton(QStringLiteral("Select Region"), regionControlsWidget_);
+    regionSummaryLabel_ = new QLabel(regionControlsWidget_);
+    regionSummaryLabel_->setWordWrap(true);
+    regionLayout->addWidget(selectRegionButton_);
+    regionLayout->addWidget(regionSummaryLabel_, 1);
     refreshButton_ = new QPushButton(QStringLiteral("Refresh"), captureGroup);
     captureLayout->addRow(QStringLiteral("Type"), captureTypeSelector_);
     captureLayout->addRow(QStringLiteral("Window"), windowSelector_);
     captureLayout->addRow(QStringLiteral("Display"), displaySelector_);
+    captureLayout->addRow(QStringLiteral("Region"), regionControlsWidget_);
     captureLayout->addRow(QStringLiteral("Targets"), refreshButton_);
 
     auto* outputGroup = new QGroupBox(QStringLiteral("Output"), central);
@@ -146,7 +167,8 @@ void MainWindow::buildUi()
     rootLayout->addWidget(logGroup, 1);
 
     setCentralWidget(central);
-    appendLog(QStringLiteral("This build records a selected window or full display to MP4. Microphone capture is not wired yet."));
+    updateRegionSummary();
+    appendLog(QStringLiteral("This build records a selected window, full display, or selected display region to MP4. Microphone capture is not wired yet."));
 }
 
 void MainWindow::wireSignals()
@@ -158,9 +180,17 @@ void MainWindow::wireSignals()
         updateTargetSelectors();
         updateControls();
     });
+    connect(windowSelector_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int) {
+        updateControls();
+    });
+    connect(displaySelector_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int) {
+        clearSelectedRegion();
+        updateControls();
+    });
     connect(outputPathEdit_, &QLineEdit::textChanged, this, [this]() {
         updateControls();
     });
+    connect(selectRegionButton_, &QPushButton::clicked, this, &MainWindow::selectRegion);
 
     connect(browseButton_, &QPushButton::clicked, this, [this]() {
         const QString initialPath = outputPathEdit_->text().trimmed().isEmpty()
@@ -243,6 +273,7 @@ void MainWindow::updateDisplaySelector(const QList<DisplayInfo>& displays)
         displaySelector_->addItem(formatDisplayLabel(display));
     }
 
+    clearSelectedRegion();
     updateTargetSelectors();
     updateControls();
 }
@@ -251,8 +282,10 @@ void MainWindow::updateTargetSelectors()
 {
     const auto targetType = static_cast<CaptureTargetType>(captureTypeSelector_->currentData().toInt());
     const bool useWindow = targetType == CaptureTargetType::Window;
+    const bool useRegion = targetType == CaptureTargetType::Region;
     windowSelector_->setVisible(useWindow);
     displaySelector_->setVisible(!useWindow);
+    regionControlsWidget_->setVisible(useRegion);
 }
 
 void MainWindow::updateControls()
@@ -261,7 +294,10 @@ void MainWindow::updateControls()
     const auto targetType = static_cast<CaptureTargetType>(captureTypeSelector_->currentData().toInt());
     const bool hasWindowSelection = !windows_.isEmpty() && windowSelector_->currentIndex() >= 0;
     const bool hasDisplaySelection = !displays_.isEmpty() && displaySelector_->currentIndex() >= 0;
-    const bool hasTarget = targetType == CaptureTargetType::Display ? hasDisplaySelection : hasWindowSelection;
+    const bool hasRegionSelection = isValidCaptureRegion(selectedRegion_);
+    const bool hasTarget = targetType == CaptureTargetType::Window
+        ? hasWindowSelection
+        : (targetType == CaptureTargetType::Region ? hasDisplaySelection && hasRegionSelection : hasDisplaySelection);
     const bool hasOutputPath = !outputPathEdit_->text().trimmed().isEmpty();
 
     startButton_->setEnabled(!recording && hasTarget && hasOutputPath);
@@ -269,9 +305,42 @@ void MainWindow::updateControls()
     refreshButton_->setEnabled(!recording);
     captureTypeSelector_->setEnabled(!recording);
     windowSelector_->setEnabled(!recording && targetType == CaptureTargetType::Window);
-    displaySelector_->setEnabled(!recording && targetType == CaptureTargetType::Display);
+    displaySelector_->setEnabled(!recording && targetType != CaptureTargetType::Window);
+    selectRegionButton_->setEnabled(!recording && targetType == CaptureTargetType::Region && hasDisplaySelection);
     browseButton_->setEnabled(!recording);
     outputPathEdit_->setEnabled(!recording);
+}
+
+void MainWindow::updateRegionSummary()
+{
+    regionSummaryLabel_->setText(regionSummaryText(selectedRegion_));
+}
+
+void MainWindow::clearSelectedRegion()
+{
+    selectedRegion_ = {};
+    updateRegionSummary();
+}
+
+void MainWindow::selectRegion()
+{
+    const int index = displaySelector_->currentIndex();
+    if (index < 0 || index >= displays_.size()) {
+        QMessageBox::information(this, QStringLiteral("Select Region"), QStringLiteral("Choose a display first."));
+        return;
+    }
+
+    RegionSelectionOverlay overlay(displays_.at(index), this);
+    if (overlay.exec() != QDialog::Accepted || !overlay.hasSelection()) {
+        appendLog(QStringLiteral("Region selection was cancelled."));
+        return;
+    }
+
+    selectedRegion_ = overlay.selectedRegion();
+    updateRegionSummary();
+    appendLog(QStringLiteral("Selected recording region on %1: %2")
+                  .arg(displays_.at(index).name, describeCaptureRegion(selectedRegion_)));
+    updateControls();
 }
 
 RecordingOptions MainWindow::collectOptions() const
@@ -281,10 +350,13 @@ RecordingOptions MainWindow::collectOptions() const
     const auto targetType = static_cast<CaptureTargetType>(captureTypeSelector_->currentData().toInt());
     options.target.type = targetType;
 
-    if (targetType == CaptureTargetType::Display) {
+    if (targetType == CaptureTargetType::Display || targetType == CaptureTargetType::Region) {
         const int index = displaySelector_->currentIndex();
         if (index >= 0 && index < displays_.size()) {
             options.target.display = displays_.at(index);
+        }
+        if (targetType == CaptureTargetType::Region) {
+            options.target.region = selectedRegion_;
         }
     } else {
         const int index = windowSelector_->currentIndex();

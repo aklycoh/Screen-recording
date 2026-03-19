@@ -27,6 +27,16 @@ OperationResult RecordingSession::start(const RecordingOptions& options)
         return OperationResult::failure(QStringLiteral("No display selected."));
     }
 
+    if (options.target.type == CaptureTargetType::Region) {
+        if (options.target.display.nativeHandle == 0) {
+            return OperationResult::failure(QStringLiteral("No display selected for region recording."));
+        }
+
+        if (!isValidCaptureRegion(options.target.region)) {
+            return OperationResult::failure(QStringLiteral("No capture region selected."));
+        }
+    }
+
     if (options.output.outputFilePath.trimmed().isEmpty()) {
         return OperationResult::failure(QStringLiteral("Output file path is empty."));
     }

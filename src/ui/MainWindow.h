@@ -12,6 +12,7 @@ class QLineEdit;
 class QPlainTextEdit;
 class QPushButton;
 class QSpinBox;
+class QWidget;
 
 class MainWindow : public QMainWindow
 {
@@ -28,6 +29,9 @@ private:
     void updateDisplaySelector(const QList<DisplayInfo>& displays);
     void updateTargetSelectors();
     void updateControls();
+    void updateRegionSummary();
+    void clearSelectedRegion();
+    void selectRegion();
     RecordingOptions collectOptions() const;
     void appendLog(const QString& message);
 
@@ -38,6 +42,9 @@ private:
     QComboBox* captureTypeSelector_ {nullptr};
     QComboBox* windowSelector_ {nullptr};
     QComboBox* displaySelector_ {nullptr};
+    QWidget* regionControlsWidget_ {nullptr};
+    QPushButton* selectRegionButton_ {nullptr};
+    QLabel* regionSummaryLabel_ {nullptr};
     QPushButton* refreshButton_ {nullptr};
     QLineEdit* outputPathEdit_ {nullptr};
     QPushButton* browseButton_ {nullptr};
@@ -50,4 +57,5 @@ private:
     QPushButton* stopButton_ {nullptr};
     QLabel* statusLabel_ {nullptr};
     QPlainTextEdit* logView_ {nullptr};
+    CaptureRegion selectedRegion_;
 };

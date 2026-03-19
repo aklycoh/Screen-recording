@@ -36,6 +36,8 @@ qt_add_executable(mp4_recorder
     src/recording/RecordingSession.cpp
     src/ui/MainWindow.h
     src/ui/MainWindow.cpp
+    src/ui/RegionSelectionOverlay.h
+    src/ui/RegionSelectionOverlay.cpp
     src/pipeline/Packets.h
     src/capture/ICaptureSource.h
     src/audio/IAudioCaptureSource.h

@@ -6,6 +6,13 @@ namespace
 {
 QString describeTarget(const CaptureTarget& target)
 {
+    if (target.type == CaptureTargetType::Region) {
+        const QString displayName = !target.display.name.isEmpty()
+            ? target.display.name
+            : QStringLiteral("Display");
+        return QStringLiteral("%1 region [%2]").arg(displayName, describeCaptureRegion(target.region));
+    }
+
     if (target.type == CaptureTargetType::Display) {
         if (!target.display.name.isEmpty()) {
             return target.display.name;

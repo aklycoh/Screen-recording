@@ -4,6 +4,7 @@
 #include "recording/IRecordingBackend.h"
 
 #include <QByteArray>
+#include <QRect>
 #include <QSize>
 
 #include <d3d11.h>
@@ -167,6 +168,7 @@ private:
     QString fatalErrorMessage_;
 
     QSize captureSize_;
+    QRect captureContentRect_;
     QSize outputSize_;
     winrt::Windows::Foundation::TimeSpan frameDuration_ {};
     winrt::Windows::Foundation::TimeSpan lastVideoSampleEnd_ {};
