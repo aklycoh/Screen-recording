@@ -376,7 +376,9 @@ void WgcVideoRecorderBackend::initializeAudioCapture()
     {
         std::lock_guard lock(mutex_);
         audioQueue_.clear();
+        firstAudioCaptureTimestamp100ns_ = 0;
         lastEmittedAudioEnd100ns_ = 0;
+        firstAudioCaptureTimestampSeen_ = false;
         audioPacketObserved_ = false;
         audioSampleRequestedObserved_ = false;
     }
@@ -524,10 +526,12 @@ void WgcVideoRecorderBackend::cleanup()
         lastDeliveredFrame_.reset();
         emittedFrameCount_ = 0;
         firstVideoCaptureTimestamp100ns_ = 0;
+        firstAudioCaptureTimestamp100ns_ = 0;
         lastVideoSampleTimestamp100ns_ = 0;
         requiredAudioEnd100ns_ = 0;
         lastEmittedAudioEnd100ns_ = 0;
         sampleClockStart_ = {};
+        firstAudioCaptureTimestampSeen_ = false;
         firstVideoCaptureTimestampSeen_ = false;
         hasVideoSampleTimestamp_ = false;
         lastVideoSampleEnd_ = {};
@@ -1085,6 +1089,10 @@ void WgcVideoRecorderBackend::onAudioPacketCaptured(
     {
         std::lock_guard lock(mutex_);
         shouldLogFirstPacket = !audioPacketObserved_;
+        if (shouldLogFirstPacket) {
+            firstAudioCaptureTimestamp100ns_ = timestamp100ns;
+            firstAudioCaptureTimestampSeen_ = true;
+        }
         audioPacketObserved_ = true;
         if (fatalErrorMessage_.isEmpty()) {
             overflowed = audioQueue_.size() >= kMaxQueuedAudioPackets;
@@ -1337,45 +1345,12 @@ void WgcVideoRecorderBackend::onAudioSampleRequested(
             auto nextPacket = std::move(audioQueue_.front());
             audioQueue_.pop_front();
 
-            if (firstVideoCaptureTimestampSeen_) {
-                std::int64_t relativeTimestamp100ns = nextPacket.timestamp.count() - firstVideoCaptureTimestamp100ns_;
-                if (relativeTimestamp100ns + nextPacket.duration.count() <= 0) {
-                    continue;
-                }
-
-                if (relativeTimestamp100ns < 0) {
-                    const uint32_t trimFrames = hundredNsToAudioFramesCeil(-relativeTimestamp100ns);
-                    trimAudioPacketFront(nextPacket, trimFrames);
-                    nextPacket.timestamp = TimeSpan {0};
-                } else {
-                    nextPacket.timestamp = TimeSpan {relativeTimestamp100ns};
-                }
-            }
-
-            const std::int64_t overlap100ns = lastEmittedAudioEnd100ns_ - nextPacket.timestamp.count();
-            if (overlap100ns > kAudioGapTolerance100ns) {
-                const uint32_t trimFrames = hundredNsToAudioFramesCeil(overlap100ns);
-                trimAudioPacketFront(nextPacket, trimFrames);
-            }
-
             if (nextPacket.frameCount == 0 || nextPacket.pcm.isEmpty()) {
                 continue;
             }
 
-            if (nextPacket.timestamp.count() > lastEmittedAudioEnd100ns_ + kAudioGapTolerance100ns) {
-                const std::int64_t gap100ns = nextPacket.timestamp.count() - lastEmittedAudioEnd100ns_;
-                const std::int64_t silenceDuration100ns = std::min(gap100ns, targetAudioChunk100ns);
-                const uint32_t silenceFrames = std::max<uint32_t>(1, hundredNsToAudioFramesCeil(silenceDuration100ns));
-                packet = createSilenceAudioPacket(lastEmittedAudioEnd100ns_, silenceFrames);
-                lastEmittedAudioEnd100ns_ = packet->timestamp.count() + packet->duration.count();
-                audioQueue_.push_front(std::move(nextPacket));
-                break;
-            }
-
-            if (nextPacket.timestamp.count() < lastEmittedAudioEnd100ns_) {
-                nextPacket.timestamp = TimeSpan {lastEmittedAudioEnd100ns_};
-            }
-
+            nextPacket.timestamp = TimeSpan {lastEmittedAudioEnd100ns_};
+            nextPacket.duration = TimeSpan {audioFramesToHundredNs(nextPacket.frameCount)};
             lastEmittedAudioEnd100ns_ = nextPacket.timestamp.count() + nextPacket.duration.count();
             packet = std::move(nextPacket);
             concatenatedBytes = static_cast<std::size_t>(packet->pcm.size());
@@ -1384,40 +1359,15 @@ void WgcVideoRecorderBackend::onAudioSampleRequested(
             // This prevents audio from falling behind video when the transcoder serializes
             // sample requests and video pacing consumes most of the pipeline time.
             while (!audioQueue_.empty() && packet->duration.count() < targetAudioChunk100ns) {
-                auto& front = audioQueue_.front();
-                std::int64_t frontRelTs = front.timestamp.count();
-                if (firstVideoCaptureTimestampSeen_) {
-                    frontRelTs -= firstVideoCaptureTimestamp100ns_;
-                }
-
-                const std::int64_t frontOverlap = lastEmittedAudioEnd100ns_ - frontRelTs;
-                if (frontOverlap > kAudioGapTolerance100ns) {
-                    break;
-                }
-
-                const std::int64_t frontGap = frontRelTs - lastEmittedAudioEnd100ns_;
-                if (frontGap > kAudioGapTolerance100ns) {
-                    break;
-                }
-
                 auto extraPacket = std::move(audioQueue_.front());
                 audioQueue_.pop_front();
-
-                if (firstVideoCaptureTimestampSeen_) {
-                    std::int64_t relTs = extraPacket.timestamp.count() - firstVideoCaptureTimestamp100ns_;
-                    if (relTs + extraPacket.duration.count() <= 0) {
-                        continue;
-                    }
-                    if (relTs < 0) {
-                        const uint32_t trimFrames = hundredNsToAudioFramesCeil(-relTs);
-                        trimAudioPacketFront(extraPacket, trimFrames);
-                    }
-                }
 
                 if (extraPacket.frameCount == 0 || extraPacket.pcm.isEmpty()) {
                     continue;
                 }
 
+                extraPacket.timestamp = TimeSpan {lastEmittedAudioEnd100ns_};
+                extraPacket.duration = TimeSpan {audioFramesToHundredNs(extraPacket.frameCount)};
                 concatenatedBytes += static_cast<std::size_t>(extraPacket.pcm.size());
                 concatenatedSegments.push_back(std::move(extraPacket.pcm));
                 packet->frameCount += extraPacket.frameCount;

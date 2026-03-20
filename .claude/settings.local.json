@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(find /d/game/mp4 -not -path */.git/* -type d)",
-      "Bash(cmake --build . --config Release)"
+      "Bash(cmake --build . --config Release)",
+      "Bash(cmake --build build --config Release)"
     ]
   }
 }

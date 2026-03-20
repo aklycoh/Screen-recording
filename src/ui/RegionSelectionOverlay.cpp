@@ -137,9 +137,9 @@ void RegionSelectionOverlay::mouseMoveEvent(QMouseEvent* event)
 void RegionSelectionOverlay::mouseReleaseEvent(QMouseEvent* event)
 {
     if (dragging_ && event->button() == Qt::LeftButton) {
-        dragging_ = false;
         dragCurrent_ = event->position().toPoint();
         selectedLogicalRect_ = clampedSelectionRect();
+        dragging_ = false;
         selectedRegion_ = selectionInNativePixels(selectedLogicalRect_);
         if (!hasSelection()) {
             selectedLogicalRect_ = {};

@@ -154,10 +154,12 @@ private:
     std::optional<QueuedFrame> lastDeliveredFrame_;
     std::int64_t emittedFrameCount_ {0};
     std::int64_t firstVideoCaptureTimestamp100ns_ {0};
+    std::int64_t firstAudioCaptureTimestamp100ns_ {0};
     std::int64_t lastVideoSampleTimestamp100ns_ {0};
     std::int64_t requiredAudioEnd100ns_ {0};
     std::int64_t lastEmittedAudioEnd100ns_ {0};
     std::chrono::steady_clock::time_point sampleClockStart_ {};
+    bool firstAudioCaptureTimestampSeen_ {false};
     bool firstVideoCaptureTimestampSeen_ {false};
     bool hasVideoSampleTimestamp_ {false};
     bool audioPacketObserved_ {false};
